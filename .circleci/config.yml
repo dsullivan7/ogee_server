@@ -1,0 +1,153 @@
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@2.0.3
+  aws-ecr: circleci/aws-ecr@7.0.0
+  aws-ecs: circleci/aws-ecs@2.2.1
+
+commands:
+  aws-assume-role:
+    description: Assumes the specified role
+    parameters:
+      role:
+        description: Role name
+        type: string
+    steps:
+      - run: |
+          temporary_credentials=$(aws sts assume-role --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/<< parameters.role >>" --role-session-name "ci-${CIRCLE_PROJECT_REPONAME}-${CIRCLE_BUILD_NUM}-${CIRCLE_BRANCH}")
+
+          echo "Successfully assumed role"
+
+          aws_access_key_id=$(echo $temporary_credentials | jq .Credentials.AccessKeyId | xargs)
+          aws_secret_access_key=$(echo $temporary_credentials | jq .Credentials.SecretAccessKey | xargs)
+          aws_session_token=$(echo $temporary_credentials | jq .Credentials.SessionToken | xargs)
+
+          aws configure set aws_access_key_id ${aws_access_key_id}
+          aws configure set aws_secret_access_key ${aws_secret_access_key}
+          aws configure set aws_session_token ${aws_session_token}
+
+          export AWS_ACCESS_KEY_ID=${aws_access_key_id}
+          export AWS_SECRET_ACCESS_KEY=${aws_secret_access_key}
+          export AWS_SESSION_TOKEN=${aws_session_token}
+
+          {
+            echo "export AWS_ACCESS_KEY_ID=${aws_access_key_id}";
+            echo "export AWS_SECRET_ACCESS_KEY=${aws_secret_access_key}";
+            echo "export AWS_SESSION_TOKEN=${aws_session_token}";
+          } >> "$BASH_ENV"
+  envsubst:
+    description: Assumes the specified role
+    parameters:
+      input:
+        description: Input file
+        type: string
+      output:
+        description: Output file
+        type: string
+    steps:
+      - run: |
+          envsubst < << parameters.input >> > << parameters.output >>
+
+jobs:
+  lint:
+    machine:
+      image: ubuntu-2004:202104-01
+    working_directory: ~/data
+    steps:
+      - checkout
+      - run: make lint-docker
+
+  test:
+    machine:
+      image: ubuntu-2004:202104-01
+    working_directory: ~/data
+    steps:
+      - checkout
+      - run: make db-start
+      - run: make db-init
+      - run: make db-migrate
+      - run: make test-docker
+
+  build:
+    machine:
+      image: ubuntu-2004:202104-01
+    working_directory: ~/data
+    steps:
+      - checkout
+      - run: make build-docker
+      - persist_to_workspace:
+          root: .
+          paths:
+            - ./*
+
+  deploy:
+    executor: aws-ecr/default
+    working_directory: ~/data
+    environment:
+      AWS_REGION: us-east-2
+      AWS_ACCOUNT_ID: '247564283327'
+      AWS_ECR_ACCOUNT_URL: 247564283327.dkr.ecr.us-east-2.amazonaws.com
+    steps:
+      - attach_workspace:
+          at: ~/data
+      - aws-cli/setup:
+          aws-region: AWS_REGION
+      - aws-assume-role:
+          role: 'dev-admin'
+      - aws-ecr/build-and-push-image:
+          checkout: false
+          repo: pongo-db-init-57c8178
+          tag: ${CIRCLE_SHA1}
+          dockerfile: Dockerfile.db-init
+      - envsubst:
+          input: task-definition-db-init.template.json
+          output: task-definition.json
+      - aws-ecs/update-task-definition-from-json:
+          task-definition-json: task-definition.json
+      - aws-ecs/run-task:
+          cluster: 'pongo-ecs-cluster-1520594'
+          task-definition: 'pongo-db-init'
+          subnet-ids: 'subnet-075e79ab6b9ead172,subnet-0548e2af7ea21ed1a'
+          security-group-ids: 'sg-0fc108c880310be04'
+      - aws-ecr/build-and-push-image:
+          checkout: false
+          repo: pongo-migrate-990bd9f
+          tag: ${CIRCLE_SHA1}
+          dockerfile: Dockerfile.migrate
+      - envsubst:
+          input: task-definition-migrate.template.json
+          output: task-definition.json
+      - aws-ecs/update-task-definition-from-json:
+          task-definition-json: task-definition.json
+      - aws-ecs/run-task:
+          cluster: 'pongo-ecs-cluster-1520594'
+          task-definition: 'pongo-migrate'
+          subnet-ids: 'subnet-075e79ab6b9ead172,subnet-0548e2af7ea21ed1a'
+          security-group-ids: 'sg-0fc108c880310be04'
+      - aws-ecr/build-and-push-image:
+          checkout: false
+          repo: pongo-app-72db723
+          tag: ${CIRCLE_SHA1}
+          dockerfile: Dockerfile.app
+      - envsubst:
+          input: task-definition-app.template.json
+          output: task-definition.json
+      - aws-ecs/update-service:
+          cluster-name: 'pongo-ecs-cluster-1520594'
+          family: 'pongo-app'
+          service-name: 'pongo-service-app'
+          container-image-name-updates: 'container=pongo-app,tag=${CIRCLE_SHA1}'
+
+workflows:
+  pipeline:
+    jobs:
+      - lint
+      - test:
+          requires:
+            - lint
+      - build:
+          requires:
+            - test
+      - deploy:
+          requires:
+            - build

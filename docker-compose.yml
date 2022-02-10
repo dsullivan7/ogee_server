@@ -1,0 +1,70 @@
+version: '3.8'
+
+x-app-environment: &app-environment
+  DB_HOST: $DB_HOST
+  DB_PORT: $DB_PORT
+  DB_USER: $DB_USER
+  DB_NAME: $DB_NAME
+  DB_PASSWORD: $DB_PASSWORD
+  DB_SSL: $DB_SSL
+  PORT: $PORT
+  TWO_CAPTCHA_KEY: $TWO_CAPTCHA_KEY
+  ALLOWED_ORIGINS: $ALLOWED_ORIGINS
+
+x-db-environment: &db-environment
+  DB_SSL_MODE: $DB_SSL_MODE
+  DB_HOST: $DB_HOST
+  DB_PORT: $DB_PORT
+  DB_USER: $DB_USER
+  DB_NAME: $DB_NAME
+  DB_PASSWORD: $DB_PASSWORD
+  DB_DROP: $DB_DROP
+  PGPASSWORD: $DB_PASSWORD
+
+services:
+  run:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    working_dir: /app
+    volumes:
+      - ./bin:/app
+    ports:
+      - '${PORT:-7000}:${PORT:-7000}'
+    environment:
+      *app-environment
+
+  build:
+    image: golang:1.17.0-alpine
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      *app-environment
+
+  postgres:
+    image: postgres:12.7
+    environment:
+      POSTGRES_PASSWORD: $DB_PASSWORD
+      POSTGRES_USER: $DB_USER
+    ports:
+      - '${DB_PORT:-5432}:5432'
+    volumes:
+      - dbdata_12.7:/var/lib/postgresql/data
+
+  db-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.migrate
+    environment:
+      *db-environment
+
+  db-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.db-init
+    environment:
+      *db-environment
+
+volumes:
+  dbdata_12.7:
